@@ -3642,6 +3642,29 @@ fn encoded_node_len(node: &Node, depth: usize, count: &mut usize) -> Result<usiz
             }
             length
         }
+        Node::SwatchGrid { swatches, .. } => {
+            if swatches.len() > u8::MAX as usize {
+                return Err(ProtocolError::TooManyNodes);
+            }
+            // Tag, id, columns, margin, padding and count.
+            let mut length = 11;
+            for swatch in swatches {
+                add_encoded_len(&mut length, encoded_string_len(&swatch.label)?)?;
+                add_encoded_len(
+                    &mut length,
+                    if matches!(
+                        swatch.fill,
+                        kobo_ui::SwatchFill::Empty | kobo_ui::SwatchFill::Invisible
+                    ) {
+                        1
+                    } else {
+                        2
+                    },
+                )?;
+                add_encoded_len(&mut length, if swatch.action.is_some() { 5 } else { 1 })?;
+            }
+            length
+        }
         Node::Rows { rows, .. } => {
             if rows.len() > u8::MAX as usize {
                 return Err(ProtocolError::TooManyNodes);
@@ -4836,6 +4859,39 @@ fn encode_node(
                         output.push(1);
                         output.push(encode_glyph(glyph));
                     }
+                }
+            }
+        }
+        Node::SwatchGrid {
+            id,
+            columns,
+            margin_tenth_mm,
+            padding_tenth_mm,
+            swatches,
+        } => {
+            output.push(44);
+            push_u32(output, id.0);
+            output.push(*columns);
+            push_u16(output, *margin_tenth_mm);
+            push_u16(output, *padding_tenth_mm);
+            output.push(u8::try_from(swatches.len()).map_err(|_| ProtocolError::TooManyNodes)?);
+            for swatch in swatches {
+                push_string(output, &swatch.label)?;
+                match swatch.fill {
+                    kobo_ui::SwatchFill::Empty => output.push(0),
+                    kobo_ui::SwatchFill::Filled(tone) => {
+                        output.push(1);
+                        output.push(tone);
+                    }
+                    kobo_ui::SwatchFill::Ghost(tone) => {
+                        output.push(2);
+                        output.push(tone);
+                    }
+                    kobo_ui::SwatchFill::Invisible => output.push(3),
+                }
+                output.push(u8::from(swatch.action.is_some()));
+                if let Some(action) = swatch.action {
+                    push_u32(output, action.0);
                 }
             }
         }
@@ -6110,6 +6166,44 @@ fn decode_node(
                 columns,
                 square,
                 cells,
+            })
+        }
+        44 => {
+            let columns = reader.u8()?;
+            if columns == 0 || columns > kobo_ui::MAX_SWATCH_COLUMNS {
+                return Err(ProtocolError::InvalidValue("swatch grid columns"));
+            }
+            let margin_tenth_mm = reader.u16()?;
+            let padding_tenth_mm = reader.u16()?;
+            let len = usize::from(reader.u8()?);
+            if len > kobo_ui::MAX_CELLS {
+                return Err(ProtocolError::TooManyNodes);
+            }
+            let mut swatches = Vec::with_capacity(len);
+            for _ in 0..len {
+                let label = reader.string()?;
+                let mut swatch = match reader.u8()? {
+                    0 => kobo_ui::Swatch::new(label, false),
+                    1 => kobo_ui::Swatch::filled(label, reader.u8()?),
+                    2 => kobo_ui::Swatch::ghost_toned(label, reader.u8()?),
+                    3 => kobo_ui::Swatch::invisible(label),
+                    _ => return Err(ProtocolError::InvalidValue("swatch fill")),
+                };
+                if reader.u8()? != 0 {
+                    let action = ActionId(reader.u32()?);
+                    if action.is_reserved() {
+                        return Err(ProtocolError::InvalidValue("reserved action id"));
+                    }
+                    swatch = swatch.with_action(action);
+                }
+                swatches.push(swatch);
+            }
+            Ok(Node::SwatchGrid {
+                id,
+                columns,
+                margin_tenth_mm,
+                padding_tenth_mm,
+                swatches,
             })
         }
         14 => {
@@ -7603,6 +7697,44 @@ mod node_coverage_tests {
         match round_trip(screen).nodes.first() {
             Some(Node::Grid { cells: back, .. }) => assert_eq!(back, &cells),
             other => panic!("expected a grid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_swatch_grid_keeps_its_fill_and_spacing_across_the_wire() {
+        let swatches = vec![
+            kobo_ui::Swatch::new("t", false),
+            kobo_ui::Swatch::new("T", true),
+            kobo_ui::Swatch::new(" ", false).with_action(ActionId(9)),
+            kobo_ui::Swatch::ghost("g"),
+            kobo_ui::Swatch::filled("b", 40),
+            kobo_ui::Swatch::ghost_toned("d", 220),
+            kobo_ui::Swatch::invisible("i"),
+        ];
+        let screen = Screen::new(
+            1,
+            vec![Node::SwatchGrid {
+                id: NodeId(1),
+                columns: 8,
+                margin_tenth_mm: 10,
+                padding_tenth_mm: 5,
+                swatches: swatches.clone(),
+            }],
+        );
+        match round_trip(screen).nodes.first() {
+            Some(Node::SwatchGrid {
+                columns,
+                margin_tenth_mm,
+                padding_tenth_mm,
+                swatches: back,
+                ..
+            }) => {
+                assert_eq!(*columns, 8);
+                assert_eq!(*margin_tenth_mm, 10);
+                assert_eq!(*padding_tenth_mm, 5);
+                assert_eq!(back, &swatches);
+            }
+            other => panic!("expected a swatch grid, got {other:?}"),
         }
     }
 

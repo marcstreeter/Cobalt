@@ -21,11 +21,14 @@ pub use kobo_ui::{
     terminal_grid, terminal_grid_for, typographic_cover, ActionId, BandAlign, BandSlot,
     BannerLevel, BarAction, BarStyle, BottomAction, Caret, Cell, Chip, Chrome, ControlState,
     DiagnosticSeverity, DisplayMetrics, Emphasis, Fold, FontHandle, Freeform, Glyph, InlineFormula,
-    LayoutIssue, LayoutIssueKind, NavBar, Node, NodeId, Overlay, OverlayKind, ParagraphAlignment,
+    Layout, LayoutIssue, LayoutIssueKind, LayoutKind, LayoutNode, NavBar, Node, NodeId, Overlay,
+    OverlayKind, ParagraphAlignment,
     ParagraphPresentation, Percent, PictureHandle, ProseArea, RichTextSpan, Row, RowLead, RowState,
-    Screen, SlotWidth, Space, TextHit, TextPresentation, TextSelection, Tile, TilePicture,
+    Screen, SlotWidth, Space, Swatch, SwatchFill, TextHit, TextPresentation, TextSelection, Tile,
+    TilePicture,
     TileShape, TileState, TopBar, TransferFailure, CLARA_BW_METRICS, MAX_BAND_SLOTS, MAX_CELLS,
     MAX_CHIPS, MAX_CHOICE_OPTIONS, MAX_COLUMNS, MAX_INLINE_FORMULAE, MAX_QUOTE_DEPTH, MAX_ROWS,
+    MAX_SWATCH_COLUMNS,
     MAX_TABS, MAX_TERMINAL_COLUMNS, MAX_TERMINAL_ROWS, TILE_BADGE_LIMIT,
 };
 use std::collections::BTreeMap;
@@ -2175,6 +2178,51 @@ impl ScreenBuilder {
             columns: columns.clamp(1, MAX_COLUMNS),
             square,
             cells,
+        });
+        self
+    }
+
+    /// A square grid of non-interactive cells, each outlined or solid-filled.
+    ///
+    /// For a board whose squares are mostly looked at, not tapped: a falling
+    /// piece in a puzzle game, a heatmap, anything display-only. Unlike
+    /// [`Self::grid`], a [`kobo_ui::Swatch`] carries no [`ActionId`] unless
+    /// the caller asks for one with [`kobo_ui::Swatch::with_action`] -- the
+    /// common cell has nothing for a tap to land on, so there is no press
+    /// feedback to suppress and no touch target to validate, but a caller
+    /// that wants a handful of squares to double as gesture zones (the
+    /// board itself standing in for buttons it no longer has room for) can
+    /// still ask for that a cell at a time.
+    ///
+    /// `margin_tenth_mm` is the gap between cells and `padding_tenth_mm` is
+    /// the gap between a cell's own edge and its label, both in tenths of a
+    /// millimetre -- exposed directly, unlike the fixed spacing every other
+    /// grid in this SDK uses, because a swatch grid's density is the
+    /// caller's own logical pattern rather than a list of named
+    /// destinations the renderer is best placed to space.
+    #[must_use]
+    pub fn swatch_grid<I>(
+        mut self,
+        columns: u8,
+        margin_tenth_mm: u16,
+        padding_tenth_mm: u16,
+        cells: I,
+    ) -> Self
+    where
+        I: IntoIterator<Item = kobo_ui::Swatch>,
+    {
+        let id = self.next_id();
+        let mut source = cells.into_iter();
+        let swatches: Vec<_> = source.by_ref().take(MAX_CELLS).collect();
+        if source.next().is_some() {
+            self.warn_limit(id, "swatch grid cells", MAX_CELLS);
+        }
+        self.nodes.push(Node::SwatchGrid {
+            id,
+            columns: columns.clamp(1, MAX_SWATCH_COLUMNS),
+            margin_tenth_mm,
+            padding_tenth_mm,
+            swatches,
         });
         self
     }

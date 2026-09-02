@@ -683,6 +683,14 @@ pub mod tone {
     /// these two mean the same thing.
     pub const RULE_LIGHT: u8 = 200;
     pub const FOCUS: u8 = 0;
+    /// A [`crate::Swatch`] previewing where a piece would land, or anything
+    /// else that wants to read as "present, but not really there yet" --
+    /// genuinely lighter than [`INK`] rather than a dithered approximation
+    /// of it. The panel already renders real intermediate tones (`MUTED`,
+    /// `RULE`, `SURFACE` all predate this one), so a plain grey fill is both
+    /// simpler and more legible at small sizes than synthesizing one out of
+    /// alternating ink and paper pixels would be.
+    pub const GHOST: u8 = 200;
 }
 
 // Same weight, no hierarchy: the line closing the top bar has to read as
@@ -2871,6 +2879,32 @@ pub enum Node {
         square: bool,
         cells: Vec<Cell>,
     },
+    /// A grid of equally sized, non-interactive cells, each either an
+    /// outline or a solid fill.
+    ///
+    /// [`Node::Grid`] answers "a board with cells a reader taps"; this
+    /// answers "a board a reader only ever looks at" -- a falling piece in a
+    /// puzzle game, a heatmap, anything whose cells carry a fact rather than
+    /// a destination. Every [`Cell`] in a `Grid` carries an [`ActionId`],
+    /// which is right for a keyboard and wrong here: a display-only cell
+    /// that happened to sit under a real action would flash the platform's
+    /// own touch-press feedback for a tap that does nothing, which is a
+    /// worse answer than not being tappable at all. A `Swatch` carries no
+    /// action, so there is nothing for a tap to find.
+    ///
+    /// `margin_tenth_mm` and `padding_tenth_mm` are exposed directly, unlike
+    /// every other grid in this module, because a swatch grid's whole
+    /// purpose is a caller-drawn pattern (a game board's own logical rows
+    /// and columns) rather than a list of named destinations -- the one
+    /// case in this file where the visual density is the caller's call to
+    /// make, not the renderer's.
+    SwatchGrid {
+        id: NodeId,
+        columns: u8,
+        margin_tenth_mm: u16,
+        padding_tenth_mm: u16,
+        swatches: Vec<Swatch>,
+    },
     Rows {
         id: NodeId,
         rows: Vec<Row>,
@@ -3384,6 +3418,114 @@ impl Cell {
     }
 }
 
+/// How one [`Swatch`] is drawn.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SwatchFill {
+    /// An outline, label in ink.
+    Empty,
+    /// Nothing at all: no outline, no fill. For a grid where an empty cell
+    /// should read as bare page rather than a ruled-off square -- a piece
+    /// preview, say, where only the shape itself should be visible and nothing
+    /// should mark out the cells it isn't using.
+    Invisible,
+    /// Solid `tone`, label inverted, with a few small flecks in a
+    /// contrasting tone scattered across it for texture -- a caller asking
+    /// for visual variety between filled squares (a wall of bricks, say)
+    /// gets it by choosing its own `tone` per square rather than this type
+    /// inventing a palette no caller asked for.
+    Filled(u8),
+    /// Solid `tone`, no texture -- flat is what tells a preview or a
+    /// passing effect apart from a real, textured block.
+    Ghost(u8),
+}
+
+/// One square of a [`Node::SwatchGrid`].
+///
+/// Carries no [`ActionId`] by default, unlike [`Cell`] -- most callers want a
+/// display-only grid and get one for free. A cell that does need to answer a
+/// tap opts in with [`Self::with_action`] instead of the grid switching over
+/// to [`Cell`] wholesale, because a board that is mostly decoration and only
+/// occasionally a control (a piece's own gesture zones, say) still wants
+/// every square drawn and sized as a swatch, not a touch target.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Swatch {
+    pub label: String,
+    pub fill: SwatchFill,
+    /// What a tap on this square answers, if anything. `None` for the common
+    /// case: a square that is only ever looked at.
+    pub action: Option<ActionId>,
+}
+
+impl Swatch {
+    #[must_use]
+    pub fn new(label: impl Into<String>, filled: bool) -> Self {
+        Self {
+            label: label.into(),
+            fill: if filled {
+                SwatchFill::Filled(tone::INK)
+            } else {
+                SwatchFill::Empty
+            },
+            action: None,
+        }
+    }
+
+    /// A square that draws nothing at all -- see [`SwatchFill::Invisible`].
+    #[must_use]
+    pub fn invisible(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            fill: SwatchFill::Invisible,
+            action: None,
+        }
+    }
+
+    /// A filled square in a caller-chosen tone rather than plain ink -- see
+    /// [`SwatchFill::Filled`].
+    #[must_use]
+    pub fn filled(label: impl Into<String>, tone: u8) -> Self {
+        Self {
+            label: label.into(),
+            fill: SwatchFill::Filled(tone),
+            action: None,
+        }
+    }
+
+    /// A square previewing where something would land, drawn in
+    /// `tone::GHOST` rather than solid ink -- see [`SwatchFill::Ghost`].
+    #[must_use]
+    pub fn ghost(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            fill: SwatchFill::Ghost(tone::GHOST),
+            action: None,
+        }
+    }
+
+    /// A [`Self::ghost`] in a caller-chosen tone rather than the fixed
+    /// `tone::GHOST` -- for an effect that wants its own shade, or several
+    /// shades across a group of squares.
+    #[must_use]
+    pub fn ghost_toned(label: impl Into<String>, tone: u8) -> Self {
+        Self {
+            label: label.into(),
+            fill: SwatchFill::Ghost(tone),
+            action: None,
+        }
+    }
+
+    /// Makes this square answer a tap. Its size and drawing are unaffected
+    /// -- there is no separate pressed state or touch-target minimum, since
+    /// a caller reaching for this is usually giving several adjacent squares
+    /// the same action and relying on the group of them to be a target big
+    /// enough to hit, not any one square alone.
+    #[must_use]
+    pub const fn with_action(mut self, action: ActionId) -> Self {
+        self.action = Some(action);
+        self
+    }
+}
+
 /// One tappable label in a [`Node::Chips`] run or a [`Node::Tabs`] strip.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Chip {
@@ -3426,8 +3568,23 @@ pub const MAX_TABS: usize = 4;
 /// Eighty-one is a complete Sudoku board. The protocol and layout node budgets
 /// can carry the full board without clipping.
 pub const MAX_CELLS: usize = 81;
-/// The most columns a grid may ask for.
+/// The most columns a [`Node::Grid`] may ask for.
+///
+/// Every cell in a `Grid` is a real touch target -- this is the ceiling
+/// past which a column stops being wide enough to tap reliably on a Clara,
+/// not a wire-format or layout limit. A [`Node::SwatchGrid`]'s squares are
+/// not held to that rule individually even when one carries an action --
+/// see [`Swatch::with_action`] -- so it is bound by [`MAX_SWATCH_COLUMNS`]
+/// instead, which is a real limit rather than a touch-target one.
 pub const MAX_COLUMNS: u8 = 12;
+/// The most columns a [`Node::SwatchGrid`] may ask for.
+///
+/// Tied to [`MAX_CELLS`] rather than invented separately: a single row past
+/// this width could not hold a second row under the same per-grid cell
+/// budget anyway, so nothing is gained by allowing more. Legibility at a
+/// given column count is the caller's own call -- this is a wire-format and
+/// layout-node ceiling, not a claim that every width up to it reads well.
+pub const MAX_SWATCH_COLUMNS: u8 = MAX_CELLS as u8;
 
 /// One row of a [`Node::Table`].
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -3815,6 +3972,7 @@ impl Node {
             | Self::Splash { id, .. }
             | Self::PagedList { id, .. }
             | Self::Grid { id, .. }
+            | Self::SwatchGrid { id, .. }
             | Self::Rows { id, .. }
             | Self::Table { id, .. }
             | Self::TileGrid { id, .. }
@@ -4053,6 +4211,10 @@ pub enum LayoutKind {
     Row(ActionId),
     Cell(ActionId, CellStyle),
     CellLabel,
+    /// One square of a [`Node::SwatchGrid`]: how it is filled, the padding
+    /// between its border and its label in tenths of a millimetre, and what
+    /// it answers a tap with, if anything -- see [`Swatch`].
+    Swatch(SwatchFill, u16, Option<ActionId>),
     /// One cell of a table, drawn in the body face.
     TableCell,
     /// One cell of a table's heading row, drawn muted so the rule under it
@@ -4160,6 +4322,7 @@ impl LayoutKind {
             | Self::InlineLink(action)
             | Self::PageNext(action) => Some(action),
             Self::Back | Self::OverlayClose => Some(ActionId::BACK),
+            Self::Swatch(_, _, action) => action,
             _ => None,
         }
     }
@@ -6191,6 +6354,58 @@ fn layout_node(
             layout.nodes[index].rect.height = height;
             y.saturating_add(height)
         }
+        Node::SwatchGrid {
+            id,
+            columns,
+            margin_tenth_mm,
+            padding_tenth_mm,
+            swatches,
+        } => {
+            let columns = i32::from((*columns).clamp(1, MAX_SWATCH_COLUMNS));
+            let margin = metrics.tenth_mm(i32::from(*margin_tenth_mm));
+            let cell = max_i32(1, (width - margin * (columns - 1)) / columns);
+            let index = layout.nodes.len();
+            layout.nodes.push(LayoutNode {
+                id: *id,
+                rect: Rect {
+                    x,
+                    y,
+                    width,
+                    height: 0,
+                },
+                kind: LayoutKind::Spacer,
+                text_lines: Vec::new(),
+            });
+            let mut rows = 0;
+            for (position, swatch) in swatches.iter().take(MAX_CELLS).enumerate() {
+                if layout.nodes.len() + 1 > MAX_LAYOUT_NODES {
+                    break;
+                }
+                let position = i32::try_from(position).unwrap_or(0);
+                let column = position % columns;
+                let row = position / columns;
+                rows = row + 1;
+                let rect = Rect {
+                    x: x.saturating_add(column * (cell + margin)),
+                    y: y.saturating_add(row * (cell + margin)),
+                    width: cell,
+                    height: cell,
+                };
+                layout.nodes.push(LayoutNode {
+                    id: *id,
+                    rect,
+                    kind: LayoutKind::Swatch(swatch.fill, *padding_tenth_mm, swatch.action),
+                    text_lines: vec![swatch.label.clone()],
+                });
+            }
+            let height = if rows == 0 {
+                0
+            } else {
+                rows * cell + (rows - 1) * margin
+            };
+            layout.nodes[index].rect.height = height;
+            y.saturating_add(height)
+        }
         Node::Rows { id, rows } => {
             let padding = metrics.space(Space::Small);
             let gap = metrics.space(Space::Tight);
@@ -7519,6 +7734,24 @@ pub fn has_typesetter() -> bool {
 #[must_use]
 pub fn measure_text(text: &str, size: FontSize) -> (i32, i32) {
     measure_text_in(text, size, Face::Text)
+}
+
+/// The largest of [`FontSize::Heading`], [`FontSize::Body`] and
+/// [`FontSize::Caption`] that fits `label` inside `available`, falling back
+/// to `Caption` (the smallest available) if even that overflows -- a dense
+/// [`Node::SwatchGrid`] can ask for cells small enough that nothing fits
+/// cleanly, and drawing the smallest legible mark is a better answer than
+/// drawing nothing or drawing one guaranteed to overflow. Shared between
+/// `layout_text_style` (what `validate` checks against) and the paint code
+/// (what is actually drawn) so the two can never disagree.
+fn swatch_font_size(label: &str, available: (i32, i32)) -> FontSize {
+    for size in [FontSize::Heading, FontSize::Body, FontSize::Caption] {
+        let (width, height) = measure_text(label, size);
+        if width <= available.0 && height <= available.1 {
+            return size;
+        }
+    }
+    FontSize::Caption
 }
 
 /// Returns integer pixel dimensions for one face of the installed typeface.
@@ -9607,6 +9840,14 @@ fn validate_node(
                 check_text_coverage(id, &cell.label, Face::Text, issues);
             }
         }
+        Node::SwatchGrid { swatches, .. } => {
+            if swatches.len() > MAX_CELLS {
+                issues.push(limit_issue(id, "swatch cells", swatches.len(), MAX_CELLS));
+            }
+            for swatch in swatches {
+                check_text_coverage(id, &swatch.label, Face::Text, issues);
+            }
+        }
         Node::Table { rows, .. } => {
             if rows.len() > MAX_TABLE_ROWS {
                 issues.push(limit_issue(id, "table rows", rows.len(), MAX_TABLE_ROWS));
@@ -9837,7 +10078,7 @@ fn validate_layout_nodes(layout: &Layout, metrics: &DisplayMetrics, issues: &mut
                 rect: Some(node.rect),
             });
         }
-        let Some((size, face)) = layout_text_style(node) else {
+        let Some((size, face)) = layout_text_style(node, metrics) else {
             continue;
         };
         let too_wide = node
@@ -9898,9 +10139,31 @@ const fn is_tappable(kind: LayoutKind) -> bool {
     )
 }
 
-fn layout_text_style(node: &LayoutNode) -> Option<(FontSize, Face)> {
+fn layout_text_style(node: &LayoutNode, metrics: &DisplayMetrics) -> Option<(FontSize, Face)> {
     let size = match node.kind {
         LayoutKind::Heading(level) => FontSize::for_heading_level(level),
+        // Unlike `CellLabel`, whose cell size tracks a fixed column count on
+        // a fixed panel, a `SwatchGrid`'s cell size is the caller's own
+        // choice of columns and margin -- a dense board can ask for cells
+        // too small for `FontSize::Heading` to actually fit, which is
+        // exactly what a fixed short-label-implies-heading-size rule (the
+        // one `CellLabel` uses below) would miss. Measured directly instead.
+        LayoutKind::Swatch(_, padding_tenth_mm, _) => {
+            let label = node.text_lines.first().map_or("", String::as_str);
+            // An empty label draws nothing, so it has no size to check --
+            // measuring it anyway would pick `FontSize::Heading` (an empty
+            // string "fits" any size) and then report a blank square too
+            // small for a heading it never draws as overflowing text.
+            if label.is_empty() {
+                return None;
+            }
+            let padding = metrics.tenth_mm(i32::from(padding_tenth_mm));
+            let available = (
+                max_i32(1, node.rect.width - padding * 2),
+                max_i32(1, node.rect.height - padding * 2),
+            );
+            return Some((swatch_font_size(label, available), Face::Text));
+        }
         LayoutKind::CellLabel
             if node
                 .text_lines
@@ -10662,6 +10925,59 @@ fn render_all_with_selected_font(
                     FontSize::Body
                 };
                 draw_centered(surface, &node.text_lines, node.rect, size, tone::INK, clip);
+            }
+            // Filled: solid ink, label inverted to paper -- the same pair
+            // [`Node::Chips`]'s selected state draws with. Ghost: a real
+            // light grey fill, label in ink same as an outline -- against
+            // `tone::GHOST` an inverted paper label would all but vanish.
+            // Empty: a rule at the cell's own edge, same as a [`Node::Grid`]
+            // board cell; the padding only insets the label, never the
+            // border, so a caller asking for tighter squares doesn't also
+            // get a thinner rule around them. Always drawn as a mark
+            // (`FontSize::Heading`) rather than measured against the cell's
+            // aspect the way [`LayoutKind::CellLabel`] is, because every
+            // [`Swatch`] cell is square by construction -- there is no
+            // keyboard-row shape for this node to also serve.
+            LayoutKind::Swatch(fill, _, _) if matches!(fill, SwatchFill::Invisible) => {}
+            LayoutKind::Swatch(fill, padding_tenth_mm, _) => {
+                if let SwatchFill::Filled(tone) = fill {
+                    fill_clipped(surface, node.rect, tone, clip);
+                    draw_flecks(surface, node.rect, tone, clip);
+                } else if let SwatchFill::Ghost(tone) = fill {
+                    fill_clipped(surface, node.rect, tone, clip);
+                } else {
+                    stroke_clipped(
+                        surface,
+                        node.rect,
+                        tone::RULE,
+                        metrics.rule_thickness(),
+                        clip,
+                    );
+                }
+                let padding = metrics.tenth_mm(i32::from(padding_tenth_mm));
+                let inset = Rect {
+                    x: node.rect.x.saturating_add(padding),
+                    y: node.rect.y.saturating_add(padding),
+                    width: max_i32(1, node.rect.width - padding * 2),
+                    height: max_i32(1, node.rect.height - padding * 2),
+                };
+                // `swatch_font_size` is the same call `layout_text_style`
+                // makes, so what is drawn here and what `validate` checked
+                // against can never disagree.
+                let label = node.text_lines.first().map_or("", String::as_str);
+                let size = swatch_font_size(label, (inset.width, inset.height));
+                draw_centered(
+                    surface,
+                    &node.text_lines,
+                    inset,
+                    size,
+                    if matches!(fill, SwatchFill::Filled(_)) {
+                        tone::PAPER
+                    } else {
+                        tone::INK
+                    },
+                    clip,
+                );
             }
             LayoutKind::Divider => fill_clipped(surface, node.rect, tone::RULE, clip),
             LayoutKind::RowRule => fill_clipped(surface, node.rect, tone::RULE_LIGHT, clip),
@@ -11754,6 +12070,50 @@ fn draw_caret(surface: &mut Surface, rect: Rect, side: Side, clip: Rect) {
 fn fill_clipped(surface: &mut Surface, rect: Rect, tone: u8, clip: Rect) {
     if let Some(rect) = rect.intersection(clip) {
         surface.fill_rect(rect, tone);
+    }
+}
+
+/// A handful of small marks in a tone contrasting with `base_tone`, at
+/// positions derived from `base_tone` and `rect`'s own position rather than
+/// drawn from an outside source of randomness -- the same square painted
+/// again lands on the same flecks, so a caller that repaints every tick
+/// (most of them do) gets a stable texture rather than static. The tone and
+/// the positions come from one small xorshift stream seeded by both, so two
+/// squares that happen to share a tone still fleck differently as long as
+/// they sit at different places on the panel.
+fn draw_flecks(surface: &mut Surface, rect: Rect, base_tone: u8, clip: Rect) {
+    let fleck_tone = if base_tone < 128 {
+        base_tone.saturating_add(60)
+    } else {
+        base_tone.saturating_sub(60)
+    };
+    let width_span = max_i32(1, rect.width - 3);
+    let height_span = max_i32(1, rect.height - 3);
+    let mut seed = u32::from(base_tone)
+        .wrapping_mul(2_654_435_761)
+        .wrapping_add((rect.x as u32).wrapping_mul(97))
+        .wrapping_add((rect.y as u32).wrapping_mul(193))
+        .max(1);
+    for _ in 0..3 {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        let fx = rect.x + (seed % width_span as u32) as i32;
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        let fy = rect.y + (seed % height_span as u32) as i32;
+        fill_clipped(
+            surface,
+            Rect {
+                x: fx,
+                y: fy,
+                width: 2,
+                height: 2,
+            },
+            fleck_tone,
+            clip,
+        );
     }
 }
 
@@ -13451,12 +13811,15 @@ mod chrome_tests {
         // than the first heading of the content underneath it, which inverts
         // the hierarchy Kobo's own reader uses.
         assert!(
-            layout_text_style(&LayoutNode {
-                id: NodeId(1),
-                rect: Rect::default(),
-                kind: LayoutKind::TopBarTitle,
-                text_lines: vec!["Cobalt".to_owned()],
-            })
+            layout_text_style(
+                &LayoutNode {
+                    id: NodeId(1),
+                    rect: Rect::default(),
+                    kind: LayoutKind::TopBarTitle,
+                    text_lines: vec!["Cobalt".to_owned()],
+                },
+                &CLARA_BW_METRICS,
+            )
             .is_some_and(|(size, _)| size.tenth_mm() < FontSize::Title.tenth_mm()),
             "the bar title is still set at title size"
         );
