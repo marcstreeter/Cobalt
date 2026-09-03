@@ -947,6 +947,12 @@ pub struct BarAction {
     /// recognises with no word anywhere near it is how a panel becomes a
     /// puzzle. Only the drawing changes.
     pub glyph: Option<Glyph>,
+    /// kobot local patch, 2026-09: same meaning as [`ControlState`] on
+    /// `Button`/`Tile`/`StepperControl` -- a bar entry that names an action
+    /// the reader cannot currently take (e.g. `Left`/`Right` while the game
+    /// is paused) is drawn muted and yields no action, rather than
+    /// disappearing from the bar entirely.
+    pub state: ControlState,
 }
 
 /// What a grid cell is: part of a board, or a key.
@@ -998,6 +1004,7 @@ impl BarAction {
             action,
             label: label.into(),
             glyph: None,
+            state: ControlState::Enabled,
         }
     }
 
@@ -1005,6 +1012,14 @@ impl BarAction {
     #[must_use]
     pub const fn with_glyph(mut self, glyph: Glyph) -> Self {
         self.glyph = Some(glyph);
+        self
+    }
+
+    /// kobot local patch, 2026-09: mutes this entry -- see the field doc on
+    /// [`Self::state`].
+    #[must_use]
+    pub const fn disabled(mut self) -> Self {
+        self.state = ControlState::Disabled;
         self
     }
 }
@@ -2440,9 +2455,13 @@ fn layout_nav_bar(nav_bar: &NavBar, metrics: &DisplayMetrics, layout: &mut Layou
                 height,
             },
             kind: if nav_bar.style == BarStyle::Navigation && nav_bar.selected == Some(index) {
-                LayoutKind::NavDestinationSelected(destination.action, destination.glyph)
+                LayoutKind::NavDestinationSelected(
+                    destination.action,
+                    destination.glyph,
+                    destination.state,
+                )
             } else {
-                LayoutKind::NavDestination(destination.action, destination.glyph)
+                LayoutKind::NavDestination(destination.action, destination.glyph, destination.state)
             },
             text_lines: vec![destination.label.clone()],
         });
@@ -4261,8 +4280,8 @@ pub enum LayoutKind {
     /// An entry in the bottom bar. The mark is optional and drawn above the
     /// word, never in place of it: a bar entry is often the only way off a
     /// screen.
-    NavDestination(ActionId, Option<Glyph>),
-    NavDestinationSelected(ActionId, Option<Glyph>),
+    NavDestination(ActionId, Option<Glyph>, ControlState),
+    NavDestinationSelected(ActionId, Option<Glyph>, ControlState),
     Row(ActionId),
     Cell(ActionId, CellStyle),
     CellLabel,
@@ -4359,8 +4378,8 @@ impl LayoutKind {
             Self::Button(action, _, _)
             | Self::BarAction(action)
             | Self::BarGlyph(action, _)
-            | Self::NavDestination(action, ..)
-            | Self::NavDestinationSelected(action, ..)
+            | Self::NavDestination(action, _, ControlState::Enabled)
+            | Self::NavDestinationSelected(action, _, ControlState::Enabled)
             | Self::Tile(action, ControlState::Enabled)
             | Self::Field(action)
             | Self::FieldClear(action)
@@ -4777,7 +4796,10 @@ impl Layout {
             // control: what the reader touched was not the page.
             if matches!(
                 node.kind,
-                LayoutKind::Button(_, ControlState::Disabled, _) | LayoutKind::Scrim { .. }
+                LayoutKind::Button(_, ControlState::Disabled, _)
+                    | LayoutKind::NavDestination(_, _, ControlState::Disabled)
+                    | LayoutKind::NavDestinationSelected(_, _, ControlState::Disabled)
+                    | LayoutKind::Scrim { .. }
             ) {
                 return true;
             }
@@ -4820,8 +4842,8 @@ impl Layout {
                 LayoutKind::Button(candidate, ControlState::Enabled, _)
                 | LayoutKind::BarAction(candidate)
                 | LayoutKind::BarGlyph(candidate, _)
-                | LayoutKind::NavDestination(candidate, ..)
-                | LayoutKind::NavDestinationSelected(candidate, ..)
+                | LayoutKind::NavDestination(candidate, _, ControlState::Enabled)
+                | LayoutKind::NavDestinationSelected(candidate, _, ControlState::Enabled)
                 | LayoutKind::Tile(candidate, ControlState::Enabled)
                 | LayoutKind::Field(candidate)
                 | LayoutKind::FieldClear(candidate)
@@ -11368,7 +11390,7 @@ fn render_all_with_selected_font(
                 tone::INK,
                 clip,
             ),
-            LayoutKind::NavDestination(_, glyph) => {
+            LayoutKind::NavDestination(_, glyph, state) => {
                 draw_nav_label(
                     surface,
                     &node.text_lines,
@@ -11376,10 +11398,11 @@ fn render_all_with_selected_font(
                     metrics,
                     false,
                     glyph,
+                    state,
                     clip,
                 );
             }
-            LayoutKind::NavDestinationSelected(_, glyph) => {
+            LayoutKind::NavDestinationSelected(_, glyph, state) => {
                 draw_nav_label(
                     surface,
                     &node.text_lines,
@@ -11387,6 +11410,7 @@ fn render_all_with_selected_font(
                     metrics,
                     true,
                     glyph,
+                    state,
                     clip,
                 );
             }
@@ -11855,8 +11879,14 @@ fn draw_nav_label(
     metrics: &DisplayMetrics,
     selected: bool,
     glyph: Option<Glyph>,
+    state: ControlState,
     clip: Rect,
 ) {
+    // kobot local patch, 2026-09: `ControlState` on `BarAction`/
+    // `NavDestination` -- see the field doc on `BarAction::state`. Muted the
+    // same way a disabled `Button` is: the label/mark tone drops from
+    // `tone::INK` to `tone::MUTED`, nothing else about the layout changes.
+    let label_tone = if state.is_enabled() { tone::INK } else { tone::MUTED };
     // A mark sits above the word rather than instead of it. This band is a
     // finger wide and has the room, and it is often the only way off a screen,
     // so it is the last place to make somebody guess. The word drops to the
@@ -11883,7 +11913,7 @@ fn draw_nav_label(
                     height: side,
                 },
                 clip,
-                tone::INK,
+                label_tone,
             );
             text = Rect {
                 x: rect.x,
@@ -11893,7 +11923,7 @@ fn draw_nav_label(
             };
         }
     }
-    draw_centered(surface, lines, text, FontSize::Caption, tone::INK, clip);
+    draw_centered(surface, lines, text, FontSize::Caption, label_tone, clip);
     // Selection is marked with a bar rather than a fill. An inverted
     // destination would be the largest black area on the screen and would
     // dominate the content it is meant to be subordinate to.
@@ -11908,7 +11938,7 @@ fn draw_nav_label(
                 width: max(0, rect.width - 2 * inset),
                 height: thickness,
             },
-            tone::INK,
+            label_tone,
             clip,
         );
     }

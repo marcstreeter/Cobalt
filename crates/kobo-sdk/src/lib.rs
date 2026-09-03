@@ -1734,6 +1734,38 @@ impl ScreenBuilder {
         self
     }
 
+    /// The same, with every entry uniformly `state` -- kobot local patch,
+    /// 2026-09, for a screen that wants to keep an action bar visible (so
+    /// the reader keeps context that the controls exist) while it currently
+    /// cannot be acted on, e.g. a paused game, rather than hiding the whole
+    /// bar. See the `ControlState` field doc on `BarAction`.
+    #[must_use]
+    pub fn action_bar_marked_stateful<I, N, L>(mut self, actions: I, state: ControlState) -> Self
+    where
+        I: IntoIterator<Item = (N, L, Option<kobo_ui::Glyph>)>,
+        N: AsRef<str>,
+        L: Into<String>,
+    {
+        let id = self.next_id();
+        let actions = actions
+            .into_iter()
+            .map(|(name, label, glyph)| {
+                let action = BarAction::new(self.register(name.as_ref()), label);
+                let action = match glyph {
+                    Some(glyph) => action.with_glyph(glyph),
+                    None => action,
+                };
+                match state {
+                    ControlState::Enabled => action,
+                    ControlState::Disabled => action.disabled(),
+                }
+            })
+            .collect::<Vec<_>>();
+        self.warn_second_bottom_bar(id);
+        self.nav_bar = Some(NavBar::actions(id, actions));
+        self.bottom_action = None;
+        self
+    }
 
     /// Pins one control to the bottom of the panel, where a bar would go.
     ///

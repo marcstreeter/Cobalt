@@ -4460,13 +4460,21 @@ fn encode_bar_action(output: &mut Vec<u8>, action: &BarAction) -> Result<(), Pro
             output.push(encode_glyph(glyph));
         }
     }
-    push_string(output, &action.label)
+    push_string(output, &action.label)?;
+    // kobot local patch, 2026-09: `ControlState` on `BarAction`. Appended
+    // last, after every pre-existing field including the variable-length
+    // label -- the Phase 6 `Overlay.dismissable_by_a_miss` byte was once
+    // written after its variable-length content on encode but read before
+    // it on decode, so this position is deliberately mirrored exactly on
+    // both sides below rather than trusted from memory.
+    output.push(u8::from(action.state == ControlState::Disabled));
+    Ok(())
 }
 
 /// Four for the identifier, one flag for whether it carries a mark, one more
-/// naming the mark, and the label.
+/// naming the mark, the label, and one more for `state`.
 fn encoded_bar_action_len(action: &BarAction) -> Result<usize, ProtocolError> {
-    let mut length = 5;
+    let mut length = 6;
     if action.glyph.is_some() {
         add_encoded_len(&mut length, 1)?;
     }
@@ -4487,10 +4495,19 @@ fn decode_bar_action(reader: &mut Reader<'_>) -> Result<BarAction, ProtocolError
         1 => Some(decode_glyph(reader.u8()?).ok_or(ProtocolError::InvalidValue("bar glyph"))?),
         _ => return Err(ProtocolError::InvalidValue("bar glyph flag")),
     };
+    let label = reader.string()?;
+    // kobot local patch, 2026-09: read in the exact same position it was
+    // written in above -- after the label, not before it.
+    let state = if reader.u8()? == 0 {
+        ControlState::Enabled
+    } else {
+        ControlState::Disabled
+    };
     Ok(BarAction {
         action,
-        label: reader.string()?,
+        label,
         glyph,
+        state,
     })
 }
 
@@ -7859,7 +7876,7 @@ mod node_coverage_tests {
             .with_nav_bar(NavBar::actions(
                 NodeId(202),
                 vec![
-                    BarAction::new(ActionId(9002), "Left"),
+                    BarAction::new(ActionId(9002), "Left").disabled(),
                     BarAction::new(ActionId(9003), "Right"),
                 ],
             ))
@@ -7874,6 +7891,16 @@ mod node_coverage_tests {
             back.nav_bar.as_ref().map(|bar| bar.destinations.clone()),
             screen.nav_bar.as_ref().map(|bar| bar.destinations.clone()),
             "nav bar states did not survive"
+        );
+        assert_eq!(
+            back.nav_bar.as_ref().unwrap().destinations[0].state,
+            ControlState::Disabled,
+            "BarAction.disabled() did not survive the wire"
+        );
+        assert_eq!(
+            back.nav_bar.as_ref().unwrap().destinations[1].state,
+            ControlState::Enabled,
+            "an ordinary BarAction must decode as Enabled"
         );
         assert_eq!(
             back.overlay.as_ref().map(|overlay| overlay.dismissable_by_a_miss),

@@ -3594,9 +3594,20 @@ fn pump_application(
         .map_err(|error| format!("watch the application: {error}"))?;
     let sender = sender.clone();
     thread::spawn(move || loop {
-        let Ok(frame) = kobo_protocol::read_from(&mut reader) else {
-            let _ignored = sender.send(Event::AppGone(id));
-            return;
+        let frame = match kobo_protocol::read_from(&mut reader) {
+            Ok(frame) => frame,
+            Err(error) => {
+                // kobot local patch, 2026-09: distinguishes a genuine EOF (the
+                // app process exited) from a malformed frame (a real protocol
+                // bug) -- both used to collapse into the same silent
+                // `AppGone`, which is what made an earlier real-device crash
+                // investigation take a whole night: there was no way to tell
+                // "the app quit" from "kobod's own decoder choked" from the
+                // log alone.
+                println!("application {id} disconnected: {error:?}");
+                let _ignored = sender.send(Event::AppGone(id));
+                return;
+            }
         };
         if sender.send(Event::App(id, Box::new(frame))).is_err() {
             return;
