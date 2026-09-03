@@ -679,7 +679,16 @@ pub const LIBRA_COLOUR_390: DeviceProfile = DeviceProfile {
     touch_y_min: 0,
     touch_y_max: 1264,
     serial_prefix: "N428",
-    firmware_versions: &["4.45.23697"],
+    // LOCAL OVERRIDE, not upstream: added "4.46.23836" after `kobo doctor`
+    // matched every other field (device code, framebuffer, touch, and this
+    // same kernel_release) against our own N428 on that firmware. Kernel is
+    // unchanged from the 4.45.23697 evidence PR #49 was reviewed against, so
+    // the HWTCON/touch ioctl surface this profile depends on should be
+    // identical; the panel-write behavior on 4.46.23836 itself is still
+    // unattested upstream. Report back to
+    // https://github.com/BandarLabs/Cobalt/issues/28 once this has been
+    // exercised on real hardware.
+    firmware_versions: &["4.45.23697", "4.46.23836"],
     kernel_release: "4.9.77",
     write_ready: true,
     // Off until measured here. The evidence behind the reap is from a Realtek

@@ -240,6 +240,14 @@ pub enum Emphasis {
     /// Filled. At most one per screen, and the layout does not enforce that,
     /// an author who fills everything is back where this started.
     Primary,
+    /// No border, no fill -- just the label, in ink. For a control that
+    /// reads as a navigational affordance beside other unbordered chrome (a
+    /// header title next to a menu toggle, say) rather than as one choice
+    /// among several on the screen, where `Normal`'s outline would be the
+    /// odd shape out. Still a real touch target: this changes only what is
+    /// drawn, not whether the control can be reached or tapped. kobot local
+    /// patch, 2026-09.
+    Plain,
 }
 
 /// The deepest a [`Node::Quote`] is drawn.
@@ -911,9 +919,16 @@ pub struct Status {
 /// panel and the host simulation) and only one of them was doing this. A
 /// preview drawn without the way back is a preview of a screen that will never
 /// exist, and it hides the one defect that leaves somebody stuck.
+///
+/// Skipped when the screen itself claims [`Screen::owns_back`]: that is an
+/// application saying it *did* ask for first refusal on going back and has
+/// its own visible way out already (a close cross, a Resume button), so the
+/// fallback bar is not filling a gap there, it is drawing a second, redundant
+/// one on top of a custom header the application built on purpose. kobot
+/// local patch, 2026-09.
 #[must_use]
 pub fn ensure_way_back(mut screen: Screen, chrome: &Chrome, name: &str) -> Screen {
-    if chrome.back && screen.top_bar.is_none() {
+    if chrome.back && screen.top_bar.is_none() && !screen.owns_back {
         screen = screen.with_top_bar(TopBar::new(NodeId(0), name));
     }
     screen
@@ -1120,6 +1135,14 @@ pub struct Overlay {
     /// list of choices, where a title is a line of chrome nobody reads.
     pub title: String,
     pub nodes: Vec<Node>,
+    /// Forces a tap that misses to dismiss this overlay, even when `kind` is
+    /// [`OverlayKind::Modal`] (a `Popover` already dismisses on a miss by
+    /// construction -- this cannot turn that back off). kobot local patch,
+    /// 2026-09: for a modal whose only content is something to read and then
+    /// close again (an About box, say) rather than a real decision with
+    /// consequences, where `Modal`'s upstream "a miss answers nothing" reasoning
+    /// doesn't apply. See [`Self::dismissed_by_a_miss`].
+    pub dismissable_by_a_miss: bool,
 }
 
 /// Which of the two kinds of overlay this is.
@@ -1149,6 +1172,7 @@ impl Overlay {
             kind: OverlayKind::Popover { anchor },
             title: String::new(),
             nodes,
+            dismissable_by_a_miss: false,
         }
     }
 
@@ -1160,6 +1184,7 @@ impl Overlay {
             kind: OverlayKind::Modal,
             title: title.into(),
             nodes,
+            dismissable_by_a_miss: false,
         }
     }
 
@@ -1169,10 +1194,20 @@ impl Overlay {
         self
     }
 
+    /// Opts a [`OverlayKind::Modal`] into dismissing on a miss too -- for a
+    /// modal that is only something to read and close again, not a real
+    /// decision with consequences. A no-op on a `Popover`, which already
+    /// dismisses on a miss.
+    #[must_use]
+    pub const fn dismissable_by_a_miss(mut self) -> Self {
+        self.dismissable_by_a_miss = true;
+        self
+    }
+
     /// Whether a tap that misses the overlay dismisses it.
     #[must_use]
     pub const fn dismissed_by_a_miss(&self) -> bool {
-        matches!(self.kind, OverlayKind::Popover { .. })
+        matches!(self.kind, OverlayKind::Popover { .. }) || self.dismissable_by_a_miss
     }
 }
 
@@ -3432,8 +3467,17 @@ pub enum SwatchFill {
     /// contrasting tone scattered across it for texture -- a caller asking
     /// for visual variety between filled squares (a wall of bricks, say)
     /// gets it by choosing its own `tone` per square rather than this type
-    /// inventing a palette no caller asked for.
+    /// inventing a palette no caller asked for. The fleck tone itself is
+    /// picked automatically (`tone` offset by 60, lighter or darker
+    /// whichever keeps contrast) -- see [`Self::FilledFleck`] for a caller
+    /// that needs to choose that tone too.
     Filled(u8),
+    /// Solid `tone`, label inverted, with flecks in a caller-chosen
+    /// contrasting tone rather than the automatic offset -- for a caller
+    /// with its own small fixed tone palette (a wall of bricks in a few
+    /// house shades, say) where the automatic ±60 pick can land on a tone
+    /// the palette doesn't actually use. kobot local patch, 2026-09.
+    FilledFleck(u8, u8),
     /// Solid `tone`, no texture -- flat is what tells a preview or a
     /// passing effect apart from a real, textured block.
     Ghost(u8),
@@ -3487,6 +3531,17 @@ impl Swatch {
         Self {
             label: label.into(),
             fill: SwatchFill::Filled(tone),
+            action: None,
+        }
+    }
+
+    /// A [`Self::filled`] whose fleck tone is chosen by the caller rather
+    /// than picked automatically -- see [`SwatchFill::FilledFleck`].
+    #[must_use]
+    pub fn filled_with_fleck(label: impl Into<String>, tone: u8, fleck_tone: u8) -> Self {
+        Self {
+            label: label.into(),
+            fill: SwatchFill::FilledFleck(tone, fleck_tone),
             action: None,
         }
     }
@@ -6421,18 +6476,19 @@ fn layout_node(
                 // trailing rule collides with whatever the screen puts next and
                 // reads as a mistake, which it was.
                 //
-                // Inset to the text margin and drawn at the weaker hairline,
-                // because a line between two rows is not doing the same job as
-                // the line under the top bar. Run full width at full weight
-                // they came out as one more identical rule per row and the
-                // screen read as ruled paper.
+                // Full row width (kobot local patch, 2026-09): this used to
+                // inset to the text margin on the theory that a line between
+                // rows isn't doing the same job as the line under the top
+                // bar, but on a live panel it reads as stopping short rather
+                // than as intentionally lighter -- still drawn at the weaker
+                // hairline tone, just no longer narrower than the row.
                 if position > 0 {
                     layout.nodes.push(LayoutNode {
                         id: *id,
                         rect: Rect {
-                            x: text_x,
+                            x,
                             y: cursor,
-                            width: max(1, width - icon - padding),
+                            width,
                             height: metrics.rule_thickness(),
                         },
                         kind: LayoutKind::RowRule,
@@ -10861,6 +10917,17 @@ fn render_all_with_selected_font(
                     clip,
                 );
             }
+            // No border, no fill -- see `Emphasis::Plain`'s own doc for why.
+            LayoutKind::Button(_, ControlState::Enabled, Emphasis::Plain) => {
+                draw_centered(
+                    surface,
+                    &node.text_lines,
+                    node.rect,
+                    FontSize::Body,
+                    tone::INK,
+                    clip,
+                );
+            }
             LayoutKind::Button(_, ControlState::Disabled, _) => {
                 stroke_rounded_clipped(
                     surface,
@@ -10942,7 +11009,10 @@ fn render_all_with_selected_font(
             LayoutKind::Swatch(fill, padding_tenth_mm, _) => {
                 if let SwatchFill::Filled(tone) = fill {
                     fill_clipped(surface, node.rect, tone, clip);
-                    draw_flecks(surface, node.rect, tone, clip);
+                    draw_flecks(surface, node.rect, tone, None, clip);
+                } else if let SwatchFill::FilledFleck(tone, fleck_tone) = fill {
+                    fill_clipped(surface, node.rect, tone, clip);
+                    draw_flecks(surface, node.rect, tone, Some(fleck_tone), clip);
                 } else if let SwatchFill::Ghost(tone) = fill {
                     fill_clipped(surface, node.rect, tone, clip);
                 } else {
@@ -10971,7 +11041,7 @@ fn render_all_with_selected_font(
                     &node.text_lines,
                     inset,
                     size,
-                    if matches!(fill, SwatchFill::Filled(_)) {
+                    if matches!(fill, SwatchFill::Filled(_) | SwatchFill::FilledFleck(_, _)) {
                         tone::PAPER
                     } else {
                         tone::INK
@@ -12081,12 +12151,20 @@ fn fill_clipped(surface: &mut Surface, rect: Rect, tone: u8, clip: Rect) {
 /// the positions come from one small xorshift stream seeded by both, so two
 /// squares that happen to share a tone still fleck differently as long as
 /// they sit at different places on the panel.
-fn draw_flecks(surface: &mut Surface, rect: Rect, base_tone: u8, clip: Rect) {
-    let fleck_tone = if base_tone < 128 {
-        base_tone.saturating_add(60)
-    } else {
-        base_tone.saturating_sub(60)
-    };
+fn draw_flecks(
+    surface: &mut Surface,
+    rect: Rect,
+    base_tone: u8,
+    fleck_tone_override: Option<u8>,
+    clip: Rect,
+) {
+    let fleck_tone = fleck_tone_override.unwrap_or_else(|| {
+        if base_tone < 128 {
+            base_tone.saturating_add(60)
+        } else {
+            base_tone.saturating_sub(60)
+        }
+    });
     let width_span = max_i32(1, rect.width - 3);
     let height_span = max_i32(1, rect.height - 3);
     let mut seed = u32::from(base_tone)
@@ -14169,23 +14247,30 @@ mod row_tests {
     }
 
     #[test]
-    fn a_rule_between_rows_starts_where_the_text_does() {
-        // Full width they were one more identical line per row, indexed to the
-        // panel rather than to the list, and the screen read as ruled paper.
+    fn a_rule_between_rows_spans_the_full_row_width() {
+        // kobot local patch (2026-09): this rule used to stop short at the
+        // text column (skipping the lead/icon width), which on a live panel
+        // read as a divider that quit partway across rather than one drawn
+        // lighter on purpose. It now matches the row's own left edge and
+        // width -- still the weaker hairline tone, just not narrower.
         let layout = list(3, "Summary.").layout_for(&CLARA_BW_METRICS);
         let rule = layout
             .nodes
             .iter()
             .find(|node| matches!(node.kind, LayoutKind::RowRule))
             .expect("a separator");
-        let title = layout
+        let row = layout
             .nodes
             .iter()
-            .find(|node| matches!(node.kind, LayoutKind::RowTitle))
-            .expect("a title");
+            .find(|node| matches!(node.kind, LayoutKind::Row(_)))
+            .expect("a row");
         assert_eq!(
-            rule.rect.x, title.rect.x,
-            "the separator did not skip the lead column"
+            rule.rect.x, row.rect.x,
+            "the separator no longer starts at the row's own left edge"
+        );
+        assert_eq!(
+            rule.rect.width, row.rect.width,
+            "the separator no longer spans the full row width"
         );
         assert!(
             rule.rect.x + rule.rect.width <= CLARA_BW_METRICS.width,
@@ -16413,6 +16498,7 @@ mod prose_tests {
                 state: ControlState::Enabled,
                 emphasis: Emphasis::Primary,
             }],
+            dismissable_by_a_miss: false,
         })
     }
 
@@ -17003,6 +17089,7 @@ mod prose_tests {
                         text: "This cannot be undone.".into(),
                         links: Vec::new(),
                     }],
+                    dismissable_by_a_miss: false,
                 });
                 let layout = screen.layout_with(&metrics, &Chrome::with_back(false));
                 let cross = layout
@@ -17056,6 +17143,7 @@ mod prose_tests {
                     text: "Standard".into(),
                     links: Vec::new(),
                 }],
+                dismissable_by_a_miss: false,
             });
         let layout = screen.layout_with(&CLARA_BW_METRICS, &Chrome::with_back(false));
         assert!(
@@ -17096,6 +17184,7 @@ mod prose_tests {
                     state: ControlState::Enabled,
                     emphasis: Emphasis::Normal,
                 }],
+                dismissable_by_a_miss: false,
             });
         let layout = screen.layout_with(&CLARA_BW_METRICS, &Chrome::with_back(false));
         let anchor = layout

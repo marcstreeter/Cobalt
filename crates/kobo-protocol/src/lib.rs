@@ -3446,7 +3446,8 @@ fn encoded_screen_len(
     // popover names, the title and the count of its nodes.
     add_encoded_len(&mut length, 1)?;
     if let Some(overlay) = &screen.overlay {
-        add_encoded_len(&mut length, 7)?;
+        // Id (4), kind tag (1), node count (2), the miss-dismiss flag (1).
+        add_encoded_len(&mut length, 8)?;
         if matches!(overlay.kind, kobo_ui::OverlayKind::Popover { .. }) {
             add_encoded_len(&mut length, 4)?;
         }
@@ -3652,13 +3653,10 @@ fn encoded_node_len(node: &Node, depth: usize, count: &mut usize) -> Result<usiz
                 add_encoded_len(&mut length, encoded_string_len(&swatch.label)?)?;
                 add_encoded_len(
                     &mut length,
-                    if matches!(
-                        swatch.fill,
-                        kobo_ui::SwatchFill::Empty | kobo_ui::SwatchFill::Invisible
-                    ) {
-                        1
-                    } else {
-                        2
+                    match swatch.fill {
+                        kobo_ui::SwatchFill::Empty | kobo_ui::SwatchFill::Invisible => 1,
+                        kobo_ui::SwatchFill::Filled(_) | kobo_ui::SwatchFill::Ghost(_) => 2,
+                        kobo_ui::SwatchFill::FilledFleck(_, _) => 3,
                     },
                 )?;
                 add_encoded_len(&mut length, if swatch.action.is_some() { 5 } else { 1 })?;
@@ -4439,6 +4437,7 @@ fn encode_screen(
                 output,
                 u16::try_from(overlay.nodes.len()).map_err(|_| ProtocolError::TooManyNodes)?,
             );
+            output.push(u8::from(overlay.dismissable_by_a_miss));
             for node in &overlay.nodes {
                 encode_node(output, node, depth, count)?;
             }
@@ -4699,6 +4698,7 @@ fn encode_node(
             output.push(match emphasis {
                 kobo_ui::Emphasis::Normal => 0,
                 kobo_ui::Emphasis::Primary => 1,
+                kobo_ui::Emphasis::Plain => 2,
             });
             push_string(output, label)?;
         }
@@ -4888,6 +4888,11 @@ fn encode_node(
                         output.push(tone);
                     }
                     kobo_ui::SwatchFill::Invisible => output.push(3),
+                    kobo_ui::SwatchFill::FilledFleck(tone, fleck_tone) => {
+                        output.push(4);
+                        output.push(tone);
+                        output.push(fleck_tone);
+                    }
                 }
                 output.push(u8::from(swatch.action.is_some()));
                 if let Some(action) = swatch.action {
@@ -5495,6 +5500,7 @@ fn decode_screen(
             if count_overlay > MAX_NODES {
                 return Err(ProtocolError::TooManyNodes);
             }
+            let dismissable_by_a_miss = reader.u8()? != 0;
             let mut overlay_nodes = Vec::with_capacity(count_overlay);
             for _ in 0..count_overlay {
                 overlay_nodes.push(decode_node(reader, depth, count)?);
@@ -5504,6 +5510,7 @@ fn decode_screen(
                 kind,
                 title,
                 nodes: overlay_nodes,
+                dismissable_by_a_miss,
             }))
         }
         _ => return Err(ProtocolError::InvalidValue("overlay flag")),
@@ -5718,6 +5725,7 @@ fn decode_node(
             // fill every control on a screen by accident.
             emphasis: match reader.u8()? {
                 1 => kobo_ui::Emphasis::Primary,
+                2 => kobo_ui::Emphasis::Plain,
                 _ => kobo_ui::Emphasis::Normal,
             },
             label: reader.string()?,
@@ -6187,6 +6195,10 @@ fn decode_node(
                     1 => kobo_ui::Swatch::filled(label, reader.u8()?),
                     2 => kobo_ui::Swatch::ghost_toned(label, reader.u8()?),
                     3 => kobo_ui::Swatch::invisible(label),
+                    4 => {
+                        let tone = reader.u8()?;
+                        kobo_ui::Swatch::filled_with_fleck(label, tone, reader.u8()?)
+                    }
                     _ => return Err(ProtocolError::InvalidValue("swatch fill")),
                 };
                 if reader.u8()? != 0 {
@@ -7821,6 +7833,53 @@ mod node_coverage_tests {
                 "node did not survive the wire: {node:?}"
             );
         }
+    }
+
+    #[test]
+    fn kobot_phase_6_additions_round_trip() {
+        let swatch_grid = Node::SwatchGrid {
+            id: NodeId(200),
+            columns: 2,
+            margin_tenth_mm: 5,
+            padding_tenth_mm: 3,
+            swatches: vec![
+                kobo_ui::Swatch::filled_with_fleck("a", 0, 110),
+                kobo_ui::Swatch::filled_with_fleck("b", 60, 110),
+                kobo_ui::Swatch::filled_with_fleck("c", 110, 0),
+            ],
+        };
+        let plain_button = Node::Button {
+            id: NodeId(201),
+            action: ActionId(9001),
+            label: "Plain".to_owned(),
+            state: ControlState::Enabled,
+            emphasis: kobo_ui::Emphasis::Plain,
+        };
+        let screen = Screen::new(9, vec![swatch_grid.clone(), plain_button.clone()])
+            .with_nav_bar(NavBar::actions(
+                NodeId(202),
+                vec![
+                    BarAction::new(ActionId(9002), "Left"),
+                    BarAction::new(ActionId(9003), "Right"),
+                ],
+            ))
+            .with_overlay(kobo_ui::Overlay::modal(NodeId(203), "About", vec![Node::Text {
+                id: NodeId(204),
+                text: "hi".to_owned(),
+                links: Vec::new(),
+            }]).dismissable_by_a_miss());
+        let back = round_trip(screen.clone());
+        assert_eq!(back.nodes, vec![swatch_grid, plain_button], "nodes did not survive");
+        assert_eq!(
+            back.nav_bar.as_ref().map(|bar| bar.destinations.clone()),
+            screen.nav_bar.as_ref().map(|bar| bar.destinations.clone()),
+            "nav bar states did not survive"
+        );
+        assert_eq!(
+            back.overlay.as_ref().map(|overlay| overlay.dismissable_by_a_miss),
+            Some(true),
+            "overlay dismissable_by_a_miss did not survive"
+        );
     }
 
     #[test]

@@ -1168,6 +1168,23 @@ impl ScreenBuilder {
         self
     }
 
+    /// A tappable label with no border and no fill -- see [`Emphasis::Plain`]
+    /// for when this is the right call instead of [`Self::button`]. kobot
+    /// local patch, 2026-09.
+    #[must_use]
+    pub fn plain_button(mut self, name: impl AsRef<str>, label: impl Into<String>) -> Self {
+        let action = self.register(name.as_ref());
+        let id = self.next_id();
+        self.nodes.push(Node::Button {
+            id,
+            action,
+            label: label.into(),
+            state: ControlState::Enabled,
+            emphasis: Emphasis::Plain,
+        });
+        self
+    }
+
     /// Adds a button that is visible but cannot currently be activated.
     #[must_use]
     pub fn disabled_button(self, name: impl AsRef<str>, label: impl Into<String>) -> Self {
@@ -1373,19 +1390,31 @@ impl ScreenBuilder {
     #[must_use]
     pub fn popover(self, anchor: impl AsRef<str>, build: impl FnOnce(Self) -> Self) -> Self {
         let anchor = action_id(anchor.as_ref());
-        self.overlay_with(OverlayKind::Popover { anchor }, String::new(), build)
+        self.overlay_with(OverlayKind::Popover { anchor }, String::new(), false, build)
     }
 
-    /// Puts a question over the screen that has to be answered.
+    /// Puts a question over the screen that has to be answered. A tap
+    /// outside is ignored -- see [`Self::dismissable_modal`] for a modal
+    /// that should close on one instead.
     #[must_use]
     pub fn modal(self, title: impl Into<String>, build: impl FnOnce(Self) -> Self) -> Self {
-        self.overlay_with(OverlayKind::Modal, title.into(), build)
+        self.overlay_with(OverlayKind::Modal, title.into(), false, build)
+    }
+
+    /// A [`Self::modal`] that also dismisses on a tap outside it -- for a
+    /// modal that is only something to read and close again (an About box,
+    /// say), not a real decision with consequences. kobot local patch,
+    /// 2026-09.
+    #[must_use]
+    pub fn dismissable_modal(self, title: impl Into<String>, build: impl FnOnce(Self) -> Self) -> Self {
+        self.overlay_with(OverlayKind::Modal, title.into(), true, build)
     }
 
     fn overlay_with(
         mut self,
         kind: OverlayKind,
         title: String,
+        dismissable_by_a_miss: bool,
         build: impl FnOnce(Self) -> Self,
     ) -> Self {
         // The screen's nodes are set aside so the closure builds into an empty
@@ -1401,6 +1430,7 @@ impl ScreenBuilder {
             kind,
             title,
             nodes,
+            dismissable_by_a_miss,
         }));
         done
     }
@@ -1703,6 +1733,7 @@ impl ScreenBuilder {
         self.bottom_action = None;
         self
     }
+
 
     /// Pins one control to the bottom of the panel, where a bar would go.
     ///

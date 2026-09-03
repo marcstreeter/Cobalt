@@ -3792,6 +3792,21 @@ mod tests {
     }
 
     #[test]
+    fn an_application_that_owns_back_is_trusted_with_its_own_way_out() {
+        // kobot local patch, 2026-09: a screen that claims `owns_back` has
+        // already asked for first refusal on going back and drawn its own
+        // visible way out (a close cross, a Resume button) -- the fallback
+        // bar this same function adds for a screen that *forgot* one would
+        // just be a second, redundant way out drawn on top of the first.
+        let owns_back = Screen::new(1, Vec::new()).with_own_back(true);
+        let fixed = kobo_ui::ensure_way_back(owns_back, &Chrome::with_back(true), "Hello");
+        assert!(
+            fixed.top_bar.is_none(),
+            "an application that owns back should not get a second, unasked-for way out"
+        );
+    }
+
+    #[test]
     fn a_held_finger_reaches_the_hold_and_a_quick_one_turns_the_page() {
         // The two intents land on the same pixels, so the only thing telling
         // them apart is how long the finger stayed down. A reading page is
